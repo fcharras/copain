@@ -23,6 +23,8 @@ IDLE_JOYPAD = dict(
     select=BFALSE,
 )
 
+DIRECTIONS = ["up", "down", "left", "right"]
+
 
 class _ActionRegistry:
     def __init__(self):
