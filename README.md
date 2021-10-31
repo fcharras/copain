@@ -1,4 +1,4 @@
-# Overview: copain, your friend to play games
+# Overview: copain, your friendly AI framework to learn and play games
 
 Interface fceux with python and run reinforcement learning.
 
