@@ -148,6 +148,7 @@ local function joypad_set()
             selec = (selec == 1)
         }
     )
+
 end
 register_action(joypad_set)  -- 11
 

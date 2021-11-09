@@ -184,7 +184,8 @@ class _CopainLoopFn:
         visible_render_background,
         rom_path,
         rom_hash,
-        loop_fn,
+        loop_fn_init,
+        copain_ai,
     ):
         self.display_visible_runner = display_visible_runner
         self.total_nb_runners = total_nb_runners
@@ -193,7 +194,8 @@ class _CopainLoopFn:
         self.visible_render_background = visible_render_background
         self.rom_path = rom_path
         self.rom_hash = rom_hash
-        self.loop_fn = loop_fn
+        self.loop_fn_init = loop_fn_init
+        self.copain_ai = copain_ai
 
     def __call__(self, handler):
         if not handler.request.getblocking():
@@ -241,18 +243,39 @@ class _CopainLoopFn:
                 f"{actual_hash} but expected hash {self.rom_hash}"
             )
 
-        loop_fn_signature = inspect.signature(self.loop_fn).parameters
-        pass_run_metadata = ("run_metadata" in loop_fn_signature) and not any(
+        kwargs = dict()
+
+        loop_fn = self.loop_fn_init()
+
+        loop_fn_signature = inspect.signature(loop_fn).parameters
+        if ("run_metadata" in loop_fn_signature) and not any(
             kind is loop_fn_signature["run_metadata"].kind
+            for kind in (
+                inspect.Parameter.VAR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
+            )
+        ):
+            kwargs["run_metadata"] = run_metadata
+
+        pass_copain_ai = ("copain_ai" in loop_fn_signature) and not any(
+            kind is loop_fn_signature["copain_ai"].kind
             for kind in (
                 inspect.Parameter.VAR_KEYWORD,
                 inspect.Parameter.VAR_POSITIONAL,
             )
         )
 
-        return self.loop_fn(
+        if pass_copain_ai is not (self.copain_ai is not None):
+            raise ValueError(
+                "Expecting an instantiated copain_ai if and only if the loop_fn expects a parameter named copain_ai"
+            )
+
+        if pass_copain_ai:
+            kwargs["copain_ai"] = self.copain_ai
+
+        return loop_fn(
             handler,
-            **(dict(run_metadata=run_metadata) if pass_run_metadata else dict()),
+            **kwargs,
         )
 
 

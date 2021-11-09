@@ -13,7 +13,7 @@ setup(
     name="copain",
     version=VERSION,
     packages=find_namespace_packages(include=["copain", "copain.*"]),
-    install_requires=["numpy"],
+    install_requires=["numpy", "pyvirtualdisplay <3", "skorch <1"],
     include_package_data=True,
     test_suite="copain",
     url="https://github.com/fcharras/copain",
