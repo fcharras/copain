@@ -17,6 +17,7 @@ NUM_RUNNERS = 1
 THREADED_SOCKET = True
 THREADED_REQUESTS = True
 
+FRAME_PER_ACTION = 5
 
 import numpy as np
 
@@ -108,12 +109,16 @@ class GradiusLoopFn:
         return inputs
 
 
+def gradius_loop_fn_init():
+    return GradiusLoopFn(FRAME_PER_ACTION)
+
+
 if __name__ == "__main__":
 
     copain = CopainRun(
         rom_path=ROM_PATH,
         rom_hash=ROM_HASH,
-        loop_fn=GradiusLoopFn(5),
+        loop_fn_init=gradius_loop_fn_init,
         threaded_socket=THREADED_SOCKET,
         threaded_requests=THREADED_REQUESTS,
         num_runners=NUM_RUNNERS,
