@@ -105,6 +105,7 @@ local function rom_gethash ()
 end
 register_action(rom_gethash)  -- 8
 
+
 -- memory.* namespace
 
 local function memory_readbyterange ()
@@ -153,6 +154,53 @@ end
 register_action(joypad_set)  -- 11
 
 
+-- savestate.* namespace
+
+driver._savestate_registry = {}
+
+local function savestate_slotted_object ()
+    local n = assert(socket.recv(socket_fd, 1))
+    local savestate_id = assert(socket.recv(socket_fd, 16))
+    n = string.byte(n)
+    driver._savestate_registry[savestate_id] = savestate.object(n)
+end
+register_action(savestate_slotted_object)  -- 12
+
+
+local function savestate_anonymous_object ()
+    local savestate_id = assert(socket.recv(socket_fd, 16))
+    driver._savestate_registry[savestate_id] = savestate.object()
+end
+register_action(savestate_anonymous_object)  -- 13
+
+
+local function savestate_save ()
+    local savestate_id = assert(socket.recv(socket_fd, 16))
+    savestate.save(driver._savestate_registry[savestate_id])
+end
+register_action(savestate_save)  -- 14
+
+
+local function savestate_load ()
+    local savestate_id = assert(socket.recv(socket_fd, 16))
+    savestate.load(driver._savestate_registry[savestate_id])
+end
+register_action(savestate_load)  -- 15
+
+
+local function savestate_persist ()
+    local savestate_id = assert(socket.recv(socket_fd, 16))
+    savestate.persist(driver._savestate_registry[savestate_id])
+end
+register_action(savestate_persist)  -- 16
+
+local function savestate_gc ()
+    local savestate_id = assert(socket.recv(socket_fd, 16))
+    driver._savestate_registry[savestate_id] = nil
+end
+register_action(savestate_gc)  -- 17
+
+
 -- misc
 
 local function get_runner_id()
@@ -160,7 +208,7 @@ local function get_runner_id()
     if string.len(runner_id) == 1 then runner_id = runner_id .. "\0" end
     socket.send(socket_fd, runner_id)
 end
-register_action(get_runner_id)  -- 12
+register_action(get_runner_id)  -- 18
 
 
 return driver
