@@ -1,4 +1,5 @@
 import inspect
+from collections import deque
 from dataclasses import dataclass, field
 from socketserver import BaseRequestHandler
 
@@ -37,9 +38,26 @@ class _ActionRegistry:
 
         def initiatored_action(driver, *args, **kwargs):
             driver.request.sendall(code)
-            return action(driver, *args, **kwargs)
+            try:
+                return action(driver, *args, **kwargs)
+            finally:
+                driver._gc()
 
         return initiatored_action
+
+
+class _Savestate:
+    GC_QUEUE = deque()
+    ID_LENGTH = 16
+
+    def __init__(self):
+        self._id = id(self).to_bytes(self.ID_LENGTH, "big")
+
+    def get_savestate_id(self):
+        return self._id
+
+    def __del__(self):
+        self.GC_QUEUE.append(self._id)
 
 
 class _Driver:
@@ -151,11 +169,70 @@ class _Driver:
             + res["select"]
         )
 
-    """misc"""
+    """savestate.* namespace"""
+
+    _EXPECTED_SAVESTATE_ID_LENGTH = 16
+    if _EXPECTED_SAVESTATE_ID_LENGTH != _Savestate.ID_LENGTH:
+        raise RuntimeError(
+            "The length of a savestate id is inconsistent: expected %s, got %s ."
+            % (_EXPECTED_SAVESTATE_ID_LENGTH, _Savestate.ID_LENGTH)
+        )
+
+    def savestate_object(self, slot: bytes = None):
+        """if not None, slot is expected to be of type bytes, of length 1, encoding a uint8"""
+
+        if slot is not None:
+            self._savestate_slotted_object(slot)
+        else:
+            self._savestate_anonymous_object()
+
+        savestate_object = _Savestate()
+        self._send_savestate_id(savestate_object)
+        return savestate_object
 
     @register_action  # 12
+    def _savestate_slotted_object(self, slot: bytes):
+        self.request.sendall(slot)
+
+    @register_action  # 13
+    def _savestate_anonymous_object(self):
+        return
+
+    @register_action  # 14
+    def savestate_save(self, savestate_object: _Savestate):
+        self._send_savestate_id(savestate_object)
+
+    @register_action  # 15
+    def savestate_load(self, savestate_object: _Savestate):
+        self._send_savestate_id(savestate_object)
+
+    @register_action  # 16
+    def savestate_persist(self, savestate_object: _Savestate):
+        self._send_savestate_id(savestate_object)
+
+    @register_action  # 17  (for internal use only)
+    def _savestate_gc(self, savestate_id):
+        self.request.sendall(savestate_id)
+
+    def _send_savestate_id(self, savestate_object):
+        self.request.sendall(savestate_object.get_savestate_id())
+
+    """misc"""
+
+    @register_action  # 18
     def get_runner_id(self):
         return np.frombuffer(self.request.recv(2), dtype=np.uint16)[0]
+
+    """internal only"""
+
+    def _gc(self):
+        self._savestates_gc()
+
+    def _savestates_gc(self):
+        gc_queue = _Savestate.GC_QUEUE
+        while gc_queue:
+            savestate_id = gc_queue.popleft()
+            self._savestate_gc(savestate_id)
 
 
 @dataclass(frozen=True)
