@@ -33,9 +33,9 @@ class GradiusLoopFn:
 
     IS_ALIVE_ADDRESS = 0x100
 
-    def __init__(self, action_per_second):
-        self.action_per_second = action_per_second
-        self._skip_after_input = action_per_second - 1
+    def __init__(self, frame_per_action):
+        self.frame_per_action = frame_per_action
+        self._skip_after_input = frame_per_action - 1
         self.random = np.random.RandomState()
 
     def __call__(self, handler, run_metadata):
@@ -89,7 +89,6 @@ class GradiusLoopFn:
         )
 
     def _get_inputs(self, gamestate):
-        # TODO: implement completely random inputs
         direction = self.random.randint(9)
         A = self.random.randint(2)
         B = self.random.randint(2)
