@@ -21,8 +21,18 @@ FRAME_PER_ACTION = 16
 NUMBER_OF_SAVESTATES = 10
 ACTIONS_PER_SAVESTATES = 12
 
+NB_FAILS_BEFORE_POSITION_CHANGE = 512
+
+PREFERRED_POSITIONS = (
+    (48, 96),  # default position when game starts
+    (48, 60),  # top half of screen
+    (48, 148),  # bottom half of screen
+    (240, 96),  # right end of screen, necessary for end boss
+)
+
+
 from collections import deque
-from weakref import WeakKeyDictionary
+from weakref import ref, WeakKeyDictionary
 
 import numpy as np
 
@@ -30,17 +40,39 @@ from copain import CopainRun
 from copain.copain_driver import P1
 
 
+PREFERRED_POSITIONS = tuple((np.int16(x), np.int16(y)) for x, y in PREFERRED_POSITIONS)
+
+
+class GameState:
+    def __init__(self, action_space_size, parent=None):
+        self.transitions = dict()
+        self.nb_dead_actions = 0
+        self.is_dead_end = False
+        self.action_space_size = action_space_size
+        self.parent = ref(parent) if parent is not None else None
+        self.depth = 0 if parent is None else (parent.depth + 1)
+
+    def mark_dead_end(self):
+        self.is_dead_end = True
+        parent = self.parent
+        del self.transitions, self.parent
+        if parent is None:
+            raise RuntimeError
+        parent = parent()
+        parent.nb_dead_actions += 1
+        if parent.nb_dead_actions == parent.action_space_size:
+            parent.mark_dead_end()
+
+
 class GradiusLoopFn:
+    ACTION_SPACE_SIZE = 9
+
     ONE = np.uint16(1)
     bONE = ONE.tobytes()
     IS_ALIVE_ADDRESS = np.uint16(0x100).tobytes()
 
     X_AXIS_ADDRESS = np.uint16(0x360).tobytes()  # range 16 (left) - 240 (right)
-    X_AXIS_BALANCE = np.uint16(80)
-    # X_AXIS_BALANCE = np.uint16(146)
     Y_AXIS_ADDRESS = np.uint16(0x320).tobytes()  # range 16 (top) - 192 (right)
-    # Y_AXIS_BALANCE = np.uint16(96)
-    Y_AXIS_BALANCE = np.uint16(50)
 
     DIRECTION_VECTORS = np.array(
         [
@@ -61,10 +93,20 @@ class GradiusLoopFn:
         DIRECTION_VECTORS[1:], ord=2, axis=1, keepdims=True
     )
 
-    def __init__(self, frame_per_action, number_of_savestates, actions_per_savestate):
+    def __init__(
+        self,
+        frame_per_action,
+        number_of_savestates,
+        actions_per_savestate,
+        preferred_positions,
+        nb_fails_before_position_change,
+    ):
         self.frame_per_action = frame_per_action
         self.number_of_savestates = number_of_savestates
         self.actions_per_savestates = actions_per_savestate
+        self.preferred_positions = preferred_positions
+        self.nb_preferred_positions = len(preferred_positions)
+        self.nb_fails_before_position_change = nb_fails_before_position_change
 
     def __call__(self, handler, run_metadata):
         self._register_handler(handler)
@@ -75,14 +117,32 @@ class GradiusLoopFn:
         savestates = deque(
             self.handler.savestate_object() for i in range(self.number_of_savestates)
         )
-        savestates_state_id = WeakKeyDictionary()
-        dead_ends = set()
+        # weakref dictionary to store the states linked to those savestates without
+        # worrying about cleaning if said savestates are deleted
+        savestates_states = WeakKeyDictionary()
 
-        state_id = None
+        # Notes about reference managements: we maintain a tree of all visited
+        # states with a tight reference management to clean the nodes as soon
+        # as the states are not reachable anymore from the loadable savestates.
+
+        # To this purpose we explicitly use only three strong references:
+        # - the reference to the root state which is the state of the oldest
+        # savestate (root_state)
+        # - the reference to the savestate currently used in case of failure
+        # (gamestate_state)
+        # - the reference to the current state (state)
+        # The states hold themselves strong references to subsequent states.
+        # All other references are weak references.
         savestate_idx = 0
         savestate = savestates[savestate_idx]
-        savestates_state_id[savestate] = savestate_id = state_id
+        savestate_state = root_state = state = GameState(self.ACTION_SPACE_SIZE)
+        savestates_states[savestate] = ref(state)
         actions_since_savestate = 0
+
+        max_depth = 0
+        nb_fails_without_improvements = 0
+        preferred_position = 0
+        preference_reset_depth = 0
 
         handler.emu_poweron()
         self._play_starting_input_sequence()
@@ -92,24 +152,7 @@ class GradiusLoopFn:
         fire_frame = True
 
         while True:
-            try:
-                direction, state_id = self._get_next_direction(state_id, dead_ends)
-            except DeadEnd as dead_end:
-                dead_ends -= set(dead_end.dead_directions)
-                dead_ends.add(state_id)
-
-                if savestate_id == state_id:
-                    if savestate_idx == 0:
-                        raise
-                    savestate_idx -= 1
-                    savestate = savestates[savestate_idx]
-                    savestate_id = savestates_state_id[savestate]
-
-                self.handler.savestate_load(savestate)
-                state_id = savestate_id
-                actions_since_savestate = 0
-                continue
-
+            direction, state = self._get_next_direction(state, preferred_position)
             inputs = self._get_direction_as_joypad_inputs(direction)
 
             for i in range(self.frame_per_action):
@@ -120,15 +163,43 @@ class GradiusLoopFn:
                 if reset := self._reset_condition():
                     break
 
-            actions_since_savestate += 1
-
             if reset:
-                dead_ends.add(state_id)
+                state.mark_dead_end()
+
+                current_depth = state.depth - 1
+                if current_depth > max_depth:
+                    max_depth = current_depth
+                    nb_fails_without_improvements = 0
+                else:
+                    nb_fails_without_improvements += 1
+
+                if nb_fails_without_improvements > self.nb_fails_before_position_change:
+                    savestate_idx = 0
+                    savestate = savestates[savestate_idx]
+                    savestate_state = savestates_states[savestate]()
+                    preference_reset_depth = max_depth
+                    max_depth = savestate_state.depth
+                    nb_fails_without_improvements = 0
+                    preferred_position = (
+                        preferred_position + 1
+                    ) % self.nb_preferred_positions
+
+                while savestate_state.is_dead_end:
+                    if savestate_idx == 0:
+                        raise RuntimeError
+                    savestate_idx -= 1
+                    savestate = savestates[savestate_idx]
+                    savestate_state = savestates_states[savestate]()
+
                 self.handler.savestate_load(savestate)
-                state_id = savestate_id
-                reset = False
+                state = savestate_state
                 actions_since_savestate = 0
                 continue
+
+            actions_since_savestate += 1
+            if state.depth > preference_reset_depth:
+                preferred_position = 0
+                preference_reset_depth = 0
 
             if actions_since_savestate < self.actions_per_savestates:
                 continue
@@ -136,18 +207,17 @@ class GradiusLoopFn:
             if savestate_idx + 1 == len(savestates):
                 savestate = savestates.popleft()
                 savestates.append(savestate)
+                root_state = savestates_states[savestates[0]]()  # noqa
             else:
                 savestate_idx += 1
                 savestate = savestates[savestate_idx]
 
-            savestates_state_id[savestate] = savestate_id = state_id
+            savestate_state = state
+            savestates_states[savestate] = ref(state)
             self.handler.savestate_save(savestate)
             self.handler.savestate_persist(savestate)
 
             actions_since_savestate = 0
-
-    def _register_handler(self, handler):
-        self.handler = handler
 
     def _play_starting_input_sequence(self):
         for i in range(2):
@@ -159,8 +229,28 @@ class GradiusLoopFn:
                 break
             self.handler.emu_frameadvance()
 
-    def _reset_condition(self):
-        return not self._is_alive()
+    def _get_next_direction(self, state, preferred_position):
+        x, y = self._xy_coordinates()
+
+        preferred_x, preferred_y = self.preferred_positions[preferred_position]
+
+        direction_toward_preferred_position = np.array(
+            (preferred_x - np.int16(x), preferred_y - np.int16(y)), dtype=np.int16
+        )
+
+        preferred_directions = (
+            -np.matmul(self.DIRECTION_VECTORS, direction_toward_preferred_position)
+        ).argsort(kind="stable")
+
+        for direction in preferred_directions:
+            if not (
+                direction_state := state.transitions.setdefault(
+                    direction, GameState(self.ACTION_SPACE_SIZE, parent=state)
+                )
+            ).is_dead_end:
+                return direction, direction_state
+
+        raise RuntimeError
 
     def _is_alive(self):
         return (
@@ -185,26 +275,6 @@ class GradiusLoopFn:
                 self.bONE,
             )[0],
         )
-
-    def _get_next_direction(self, state_id, dead_ends):
-        x, y = self._xy_coordinates()
-
-        direction_toward_balance = np.array(
-            (self.X_AXIS_BALANCE - x, self.Y_AXIS_BALANCE - y), dtype=np.int16
-        )
-
-        preferred_directions = (
-            -np.matmul(self.DIRECTION_VECTORS, direction_toward_balance)
-        ).argsort(kind="stable")
-
-        direction_ids = []
-        for direction in preferred_directions:
-            direction_id = hash((state_id, int(direction)))
-            direction_ids.append(direction_id)
-            if direction_id not in dead_ends:
-                return int(direction), direction_id
-
-        raise DeadEnd(direction_ids)
 
     def _get_direction_as_joypad_inputs(self, direction):
         if direction == 0:
@@ -232,14 +302,22 @@ class GradiusLoopFn:
 
         return not fire
 
+    def _reset_condition(self):
+        # TODO: also detect end of game ?
+        return not self._is_alive()
+
+    def _register_handler(self, handler):
+        self.handler = handler
+
 
 def gradius_loop_fn_init():
-    return GradiusLoopFn(FRAME_PER_ACTION, NUMBER_OF_SAVESTATES, ACTIONS_PER_SAVESTATES)
-
-
-class DeadEnd(Exception):
-    def __init__(self, dead_directions):
-        self.dead_directions = dead_directions
+    return GradiusLoopFn(
+        FRAME_PER_ACTION,
+        NUMBER_OF_SAVESTATES,
+        ACTIONS_PER_SAVESTATES,
+        PREFERRED_POSITIONS,
+        NB_FAILS_BEFORE_POSITION_CHANGE,
+    )
 
 
 if __name__ == "__main__":
