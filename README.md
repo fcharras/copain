@@ -53,6 +53,26 @@ Optionally:
 - to run several FCEUX instances at once, you will need to install the package `xvfb` (likely available through your package manager).
 - to run the RL scripts, you would need to set up pytorch and, for GPU computing, an appropriate cuda environment.
 
+### Docker build
+
+A dockerfile is provided to enable an easier setup of the working environment. It embeds a python environment, a lua5.1 environment, and the fceux executable.
+
+It does not contains `copain`, it is yours to install it within the container.
+
+To build the image, execute `docker build . -t copain` from within the root of the repository.
+
+Then run a container with e.g
+
+`docker run --rm -it --gpus all -e "DISPLAY=$DISPLAY" -v "$HOME/.Xauthority:/root/.Xauthority:ro" --net=host -v /path/to/copain/:/project_dir copain`
+
+where
+
+- `-it` enables interactive mode and a tty
+- `--rm` will remove the container when exiting
+- `--gpus all` requires the nvidia container toolkit, enables using the gpu from within the container
+- `-e "DISPLAY=$DISPLAY" -v "$HOME/.Xauthority:/root/.Xauthority:ro" --net=host` enables running gui (and fceux) from within the container
+- `-v /path/to/copain/:/project_dir` enables mounting your local repository in `/project_dir` within the container and subsequently install the project from within this directory.
+
 ### Installation
 
 CLI options are not implemented yet, so local installation in editable mode is recommended so you can easily edit a script before running it:
@@ -96,8 +116,9 @@ A nice milestone would be managing to perfect-score the game using a combination
 │   └── VERSION.txt
 ├── LICENSE
 ├── MANIFEST.in
-├── README.md
+├── README.md   # this readme
 ├── setup.py
+└── Dockerfile  # Dockerfile for building a working run environment
 ```
 
 ## Work in progress
