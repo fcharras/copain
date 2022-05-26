@@ -1,10 +1,10 @@
 local socket = require "posix.sys.socket"
 local unistd = require "posix.unistd"
-
-local to_uint16 = (require "utils").to_uint16
-
+local struct = require "struct"  -- TODO: replace with string.pack when lua is updated
+                                 -- and update the dockerfile accordingly
 
 local driver = { }
+local socket_fd = nil
 
 
 function driver.start ()
@@ -18,8 +18,8 @@ end
 function driver.stop ()
     assert(socket.shutdown(socket_fd, socket.SHUT_RDWR))
     assert(unistd.close(socket_fd))
-    socket_fd = false
-    driver.socket_fd = socket_fd
+    socket_fd = nil
+    driver.socket_fd = nil
 end
 
 
@@ -37,6 +37,34 @@ local function register_action (action)
 end
 
 
+-- utils
+
+local function _unpack_load (length, types)
+    local sload = assert(socket.recv(socket_fd, length))
+    return struct.unpack(types, sload)
+end
+
+
+local function _pack_load (types, ...)
+    local sload = struct.pack(types, ...)
+    assert(socket.send(socket_fd, sload))
+end
+
+
+local function _recv_bload (length_bytes, length_type)
+    local bload = _unpack_load(length_bytes, length_type)
+    bload = assert(socket.recv(socket_fd, bload))
+    return bload
+end
+
+
+local function _send_bload (bload, length_type)
+    length = string.len(bload)
+    _pack_load(length_type, length)
+    assert(socket.send(socket_fd, bload))
+end
+
+
 -- emu.* namespace
 
 local function emu_poweron ()
@@ -47,8 +75,7 @@ register_action(emu_poweron)  -- 1
 
 local SPEEDMODE_STR = {"normal", "nothrottle", "turbo", "maximum"}
 local function emu_speedmode ()
-    local speedmode_code = assert(socket.recv(socket_fd, 1))
-    speedmode_code = string.byte(speedmode_code)
+    local speedmode_code = _unpack_load(1, "B")
     emu.speedmode(SPEEDMODE_STR[speedmode_code])
 end
 register_action(emu_speedmode)  -- 2
@@ -61,8 +88,7 @@ register_action(emu_frameadvance)  -- 3
 
 
 local function emu_nframeadvance ()
-    local n = assert(socket.recv(socket_fd, 1))
-    n = string.byte(n)
+    local n = _unpack_load(1, "B")
     for step=1,n,1 do
         emu.frameadvance ()
     end
@@ -71,8 +97,7 @@ register_action(emu_nframeadvance)  -- 4
 
 
 local function emu_setrenderplanes ()
-    local args = assert(socket.recv(socket_fd, 2))
-    local sprites, background = string.byte(args, 1, 2)
+    local sprites, background = _unpack_load(2, "BB")
     sprites = sprites == 1
     background = background == 1
     emu.setrenderplanes(sprites, background)
@@ -81,9 +106,7 @@ register_action(emu_setrenderplanes)  -- 5
 
 
 local function emu_loadrom ()
-    local path = assert(socket.recv(socket_fd, 2))
-    path = to_uint16(path)
-    path = assert(socket.recv(socket_fd, path))
+    local path = _recv_bload(2, "H")
     emu.loadrom(path)
 end
 register_action(emu_loadrom)  -- 6
@@ -99,9 +122,9 @@ register_action(emu_exit)  -- 7
 
 local HASHTYPE_STR = {"md5", "base64"}
 local function rom_gethash ()
-    local hashtype = assert(socket.recv(socket_fd, 1))
-    hashtype = HASHTYPE_STR[string.byte(hashtype)]
-    socket.send(socket_fd, rom.gethash (hashtype))
+    local hashtype = _unpack_load(1, "B")
+    hashtype = HASHTYPE_STR[hashtype]
+    assert(socket.send(socket_fd, rom.gethash (hashtype)))
 end
 register_action(rom_gethash)  -- 8
 
@@ -109,12 +132,9 @@ register_action(rom_gethash)  -- 8
 -- memory.* namespace
 
 local function memory_readbyterange ()
-    local address = assert(socket.recv(socket_fd, 2))
-    local length = assert(socket.recv(socket_fd, 2))
-    address = to_uint16(address)
-    length = to_uint16(length)
+    local address, length = _unpack_load(4, "HH")
     local memory = memory.readbyterange(address, length)
-    socket.send(socket_fd, memory)
+    assert(socket.send(socket_fd, memory))
 end
 register_action(memory_readbyterange)  -- 9
 
@@ -122,12 +142,9 @@ register_action(memory_readbyterange)  -- 9
 -- ppu.* namespace
 
 local function ppu_readbyterange ()
-    local address = assert(socket.recv(socket_fd, 2))
-    local length = assert(socket.recv(socket_fd, 2))
-    address = to_uint16(address)
-    length = to_uint16(length)
+    local address, length = _unpack_load(4, "HH")
     local memory = ppu.readbyterange(address, length)
-    socket.send(socket_fd, memory)
+    assert(socket.send(socket_fd, memory))
 end
 register_action(ppu_readbyterange)  -- 10
 
@@ -135,8 +152,7 @@ register_action(ppu_readbyterange)  -- 10
 -- joypad.* namespace
 
 local function joypad_set()
-    local args = assert(socket.recv(socket_fd, 9))
-    local player, up, down, left, right, A, B, start, selec = string.byte(args, 1, 9)
+    local player, up, down, left, right, A, B, start, selec = _unpack_load(9, "BBBBBBBBB")
     joypad.set(player,
         {
             up = (up == 1),
@@ -149,7 +165,6 @@ local function joypad_set()
             selec = (selec == 1)
         }
     )
-
 end
 register_action(joypad_set)  -- 11
 
@@ -159,9 +174,8 @@ register_action(joypad_set)  -- 11
 driver._savestate_registry = {}
 
 local function savestate_slotted_object ()
-    local n = assert(socket.recv(socket_fd, 1))
+    local n = _unpack_load(1, "B")
     local savestate_id = assert(socket.recv(socket_fd, 16))
-    n = string.byte(n)
     driver._savestate_registry[savestate_id] = savestate.object(n)
 end
 register_action(savestate_slotted_object)  -- 12
@@ -201,14 +215,53 @@ end
 register_action(savestate_gc)  -- 17
 
 
+-- movie
+
+local function movie_play ()
+    local path = _recv_bload(2, "H")
+    movie.play(path, true)
+end
+register_action(movie_play)  -- 18
+
+
+local function movie_record ()
+    local path = _recv_bload(2, "H")
+    local save_type = _unpack_load(1, "B")
+    local author = _recv_bload(2, "H")
+    movie.record(path, save_type, author)
+end
+register_action(movie_record)  -- 19
+
+
+local function movie_stop ()
+    movie.stop()
+end
+register_action(movie_stop)  -- 20
+
+
+local function movie_rerecordcounting ()
+    local counting = _unpack_load(1, "B")
+    counting = string.byte(counting) > 0
+    movie.rerecordcounting(counting)
+end
+register_action(movie_rerecordcounting)  -- 21
+
+
+local function movie_rerecordcount ()
+    local rerecordcount = movie.rerecordcount()
+    _pack_load("L", rerecordcount)
+end
+register_action(movie_rerecordcount)  -- 22
+
+
 -- misc
 
 local function get_runner_id()
     local runner_id = assert(os.getenv("COPAIN_RUN_ID"))
     if string.len(runner_id) == 1 then runner_id = runner_id .. "\0" end
-    socket.send(socket_fd, runner_id)
+    assert(socket.send(socket_fd, runner_id))
 end
-register_action(get_runner_id)  -- 18
+register_action(get_runner_id)  -- 23
 
 
 return driver

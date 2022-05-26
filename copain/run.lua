@@ -1,4 +1,5 @@
-local to_uint16 = (require "utils").to_uint16
+local unpack = (require "struct").unpack
+
 local driver = require "copain_driver"
 
 
@@ -8,7 +9,7 @@ local function main ()
     while true do
         local action_code = driver.recv_action_code ()
         if string.len(action_code) == 0 then break end
-        action_code = to_uint16(action_code)
+        action_code = unpack("H", action_code)
         driver.actions_registry[action_code] ()
     end
 end

@@ -69,6 +69,9 @@ class _Driver:
 
     Not all available function in lua have been implemented yet. It's easy to
     implement other functions if necessary.
+
+    TODO: on some platforms there might be issue arising from endianness differences in python
+    and lua ?
     """
 
     register_action = _ActionRegistry().register_action
@@ -108,8 +111,7 @@ class _Driver:
     @register_action  # 6
     def emu_loadrom(self, path):
         """path is expected to be of type bytes of length at most 2**16"""
-        self.request.sendall(np.uint16(len(path)).tobytes())
-        self.request.sendall(path)
+        self._send_load(path)
 
     @register_action  # 7
     def emu_exit(self):
@@ -157,17 +159,17 @@ class _Driver:
 
         res["player"] = player
 
-        self.request.sendall(
-            res["player"]
-            + res["up"]
-            + res["down"]
-            + res["left"]
-            + res["right"]
-            + res["A"]
-            + res["B"]
-            + res["start"]
-            + res["select"]
-        )
+        self.request.sendall(b"".join((
+            res["player"],
+            res["up"],
+            res["down"],
+            res["left"],
+            res["right"],
+            res["A"],
+            res["B"],
+            res["start"],
+            res["select"]
+        )))
 
     """savestate.* namespace"""
 
@@ -217,9 +219,37 @@ class _Driver:
     def _send_savestate_id(self, savestate_object):
         self.request.sendall(savestate_object.get_savestate_id())
 
-    """misc"""
+    """movie"""
 
     @register_action  # 18
+    def movie_play(self, path):
+        """path is expected to be of type bytes of length at most 2**16"""
+        self._send_load(path)
+
+    @register_action  # 19
+    def movie_record(self, path, save_type, author):
+        """path and authors are expected to be of type bytes of length at most 2**16
+        save_type expected to be of type bytes, of length 1, encoding a uint8 0, 1 or 2"""
+        self._send_load(path)
+        self.request.sendall(save_type)
+        self._send_load(author)
+
+    @register_action  # 20
+    def movie_stop(self):
+        return
+
+    @register_action  # 21
+    def movie_rerecordcounting(self, counting):
+        self.request.sendall(BTRUE if counting else BFALSE)
+
+    @register_action  # 22
+    def movie_rerecordcount(self):
+        return np.frombuffer(self.request.recv(8), dtype=np.uint64)[0]
+
+
+    """misc"""
+
+    @register_action  # 23
     def get_runner_id(self):
         return np.frombuffer(self.request.recv(2), dtype=np.uint16)[0]
 
@@ -234,6 +264,9 @@ class _Driver:
             savestate_id = gc_queue.popleft()
             self._savestate_gc(savestate_id)
 
+    def _send_load(self, load):
+        self.request.sendall(np.uint16(len(load)).tobytes())
+        self.request.sendall(load)
 
 @dataclass(frozen=True)
 class CopainRunMetadata:

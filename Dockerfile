@@ -76,6 +76,7 @@ COPY --from=base / /
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update --quiet; apt-get install -y --no-install-recommends \
         vim \
+        nano \
         less \
         lua5.1 \
         luarocks \
@@ -98,6 +99,9 @@ RUN pip install \
         cython \
         flake8 \
     && luarocks --lua-version 5.1 install luaposix \
+    && git config --global url.https://github.com/.insteadOf git://github.com/ \
+    && luarocks --lua-version 5.1 install lua-struct \
+    && git config --global --unset url.https://github.com/.insteadOf \
     && rm -rf /tmp/*
 RUN python -m pip install torch \
     && rm -rf /tmp/*
