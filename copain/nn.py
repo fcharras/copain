@@ -1,5 +1,11 @@
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+
+from skorch import NeuralNet
+from skorch.utils import TeeGenerator
+from skorch.dataset import unpack_data
+
 from copain.utils import WeightInitializer
 
 
@@ -33,22 +39,32 @@ class CopainANN(nn.Module):
             initialize_fn_kwargs,
         )
 
-        feed_forward_steps = []
+        per_value_feed_forward_steps = []
         for d in range(depth):
             in_dim = hidden_dim if (d > 0) else (embedding_size)
             out_dim = hidden_dim if (d < (depth - 1)) else n_actions
-            feed_forward_steps.extend(
+            per_value_feed_forward_steps.extend(
                 [nn.Dropout(p_dropout), nn.ReLU(), nn.Linear(in_dim, out_dim)]
             )
 
-        feed_forward_steps.extend([nn.Dropout(p_dropout), nn.ReLU()])
+        per_slot_feed_forward_steps = []
+        for d in range(depth):
+            in_dim = hidden_dim if (d > 0) else (input_dim)
+            out_dim = hidden_dim if (d < (depth - 1)) else n_actions
+            per_slot_feed_forward_steps.extend(
+                [nn.Dropout(p_dropout), nn.ReLU(), nn.Linear(in_dim, out_dim)]
+            )
 
-        self._feed_forward = nn.Sequential(*feed_forward_steps)
+        self.nb_values_per_dim = nb_values_per_dim
+
+        self._per_value_feed_forward = nn.Sequential(*per_value_feed_forward_steps)
+        self._per_slot_feed_forward = nn.Sequential(*per_slot_feed_forward_steps)
 
         self.apply(WeightInitializer(initialize_fn, initialize_fn_kwargs))
 
     def forward(self, X):
-        return self._feed_forward(self._embedding_bag(X))
+        return (self._per_value_feed_forward(self._embedding_bag(X))
+                + self._per_slot_feed_forward(X/self.nb_values_per_dim))/2
 
 
 class _DynamicEmbeddingBag(nn.Module):
@@ -163,3 +179,61 @@ class _DynamicEmbeddingBag(nn.Module):
             self._detect_unindexed_data(X, X_remapped, row_ix)
 
         return self._embedding_bag(X_remapped)
+
+class NeuralNet(NeuralNet):
+
+    def __init__(
+            self,
+            module, criterion,
+            amp_enabled=True, amp_init_scale=19,
+            *args, **kwargs
+    ):
+
+        super(NeuralNet, self).__init__(module, criterion, *args, **kwargs)
+        self.amp_enabled = amp_enabled
+        self.amp_init_scale = amp_init_scale
+
+    def fit(self, X, y=None, **fit_params):
+        if self.amp_enabled:
+            self.scaler = GradScaler(init_scale=2**self.amp_init_scale)
+        super().fit(X, y, **fit_params)
+        return self
+
+    def train_step(self, batch, **fit_params):
+        step_accumulator = self.get_train_step_accumulator()
+
+        step = self.train_step_single(batch, **fit_params)
+        step_accumulator.store_step(step)
+        if self.amp_enabled:
+            self.scaler.step(self.optimizer_)
+            self.scaler.update()
+        else:
+            self.optimizer_.step()
+        self.optimizer_.zero_grad()
+
+        return step_accumulator.get_step()
+
+    def train_step_single(self, batch, **fit_params):
+        self._set_training(True)
+        Xi, yi = unpack_data(batch)
+        y_pred = self.infer(Xi, **fit_params)
+        with autocast(enabled=self.amp_enabled):
+            loss = self.get_loss(y_pred, yi, X=Xi, training=True)
+
+        self.scaler.scale(loss).backward() if self.amp_enabled else loss.backward()
+
+        self.notify(
+            'on_grad_computed',
+            named_parameters=TeeGenerator(self.get_all_learnable_params()),
+            batch=batch
+        )
+
+        return {
+            # get back the loss on the last batch (independent of gradient accumulation tricks)
+            'loss': loss,
+            'y_pred': y_pred,
+            }
+
+    def infer(self, *args, **kwargs):
+        with autocast(enabled=self.amp_enabled):
+            return super(NeuralNet, self).infer(*args, **kwargs)

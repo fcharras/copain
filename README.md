@@ -111,7 +111,6 @@ A nice milestone would be managing to perfect-score the game using a combination
 │   ├── rl.py  # classes that setup the RL framework
 │   ├── run.lua  # lua entrypoint
 │   ├── run.py   # python high-level classes to start a run and a scripting loop
-│   ├── utils.lua
 │   ├── utils.py
 │   └── VERSION.txt
 ├── LICENSE

@@ -8,51 +8,57 @@ ENABLE_GAME_GENIE = False
 ENABLE_SOUND = False
 
 SPEEDMODE = "maximum"
-RENDER_SPRITES = False
-RENDER_BACKGROUND = False
+RENDER_SPRITES = True
+RENDER_BACKGROUND = True
 
 TMP_FOLDER = "/tmp/"
 
-NUM_RUNNERS = 3
-THREADED_SOCKET = True
-THREADED_REQUESTS = True
+FRAME_PER_ACTION = 16
 
-FRAME_PER_ACTION = 30
+MAX_NB_ORDINARY_MEMORIES = 5000
+MAX_NB_OUTSTANDING_MEMORIES = 5000
+REWARD_CUTOFF = 0.5
+MEMORY_BURN_IN = 1000
 
-DEVICE = "cuda"
-EPOCH_DURATION = 600
-
-EXPERIENCE_REPLAY_SIZE = 100000
-EXPERIENCE_REPLAY_BURN_IN = 30000
-
-ENABLE_TRAINING = True
-
-ENABLE_AMP = True
-AMP_INIT_SCALING = 20
-TRAINING_BATCH_SIZE = 64
+TORCH_NUM_THREADS = 1
+DEVICE="cuda"
+AMP_ENABLED = True
+AMP_INIT_SCALE = 20
+BATCH_SIZE = 64
 STARTING_NB_EMBEDDINGS = 100000
 NB_EMBEDDINGS_STEP = 50000
 LR = 0.001
 
-EVALUATION_BATCH_SIZE = 32
-
-NN_DEPTH = 1
-EMBEDDING_SIZE = 256
-HIDDEN_DIM = 8192
+NN_DEPTH = 2
+EMBEDDING_SIZE = 64
+HIDDEN_DIM = 4096
 P_DROPOUT = 0.5
 
-DISCOUNT_RATE = 0.9
-EXPLORATION_RATE = 0.05
+DISCOUNT_RATE = 0.5
+EXPLORATION_RATE = 0.1
+PLAYER_WEIGHT_REFRESH_RATE = 60
+
+
+import io
+from dataclasses import astuple
+from time import sleep, perf_counter
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from torch.utils.data.dataloader import default_collate
+
+from sklearn.base import clone
+
+from skorch.callbacks import Callback
+
+from torch.utils.data import IterableDataset
 
 from copain import CopainRun
 from copain.copain_driver import P1, DIRECTIONS
-from copain.rl import CopainAI
-from copain.nn import CopainANN
+from copain.nn import NeuralNet, CopainANN
 
+from copain.rl import Experience, ExperienceMemory
 
 _GRADIUS_MEMORY_SIZE = 0x8000
 _GRADIUS_SLOT_SIZE = 0x100
@@ -63,7 +69,7 @@ def gradius_random_action():
     return torch.randint(36, size=(1,))[0]
 
 
-class GradiusLoopFn:
+class GradiusIALoopFn:
     MEMORY_BYTERANGE_START = np.uint16(0).tobytes()
     MEMORY_BYTERANGE_LENGTH = np.uint16(_GRADIUS_MEMORY_SIZE)
     MEMORY_BYTERANGE_BLENGTH = MEMORY_BYTERANGE_LENGTH.tobytes()
@@ -72,32 +78,82 @@ class GradiusLoopFn:
 
     SKIP_MULTIPLIERS = [1, 2, 4]
 
-    def __init__(self, frame_per_action):
+    def __init__(self, exploration_rate, frame_per_action, player, trainer, weight_sync_lock,
+                 experience_memory, weight_refresh_rate):
         self._skip_after_input = frame_per_action - 1
+        self.player = player
+        self.trainer = trainer
+        self.weight_sync_lock = weight_sync_lock
+        self.weight_refresh_rate = weight_refresh_rate
+        self.experience_memory = experience_memory
+        self.exploration_rate = exploration_rate
+        self._random = np.random.default_rng(42)
 
-    def __call__(self, handler, copain_ai, run_metadata):
+    def __call__(self, handler):
         self.handler = handler
         self._fire_frame = True
 
-        runner_id = run_metadata.runner_id
-        copain_ai.register_run(runner_id)
+        timer = perf_counter()
 
         while True:
             handler.emu_poweron()
             self._starting_sequence()
+            experience = None
             while True:
-                gamestate = self._get_gamestate()
-                action = copain_ai.ask_action(gamestate, runner_id)
-                time, inputs = self._get_inputs(action)
-                self._frameadvance_with_inputs_and_autofire(inputs)
-                inputs_directions = [press for press in inputs if press in DIRECTIONS]
-                for i in range(self.SKIP_MULTIPLIERS[time] * self._skip_after_input):
+                nb_frameadvances = np.inf
+                i = 0
+
+                while (i < nb_frameadvances):
                     gamestate = self._get_gamestate()
                     must_reset = self._done_condition(gamestate)
                     if must_reset:
-                        copain_ai.tell_done(gamestate, runner_id)
+                        if experience is not None:
+                            experience.state1 = gamestate
+                            experience.done = True
+                            experience.score1 = 0
+                            self.experience_memory.memorize_new_experience(experience)
                         break
-                    self._frameadvance_with_inputs_and_autofire(inputs_directions)
+
+                    if i == 0:
+                        if (perf_counter() - timer) >= self.weight_refresh_rate:
+                            print("syncing...")
+                            del self.player.module_
+                            del self.player.initialized_
+                            with self.weight_sync_lock, io.BytesIO() as ram_buffer:
+                                torch.save(self.trainer.module_, ram_buffer)
+                                ram_buffer.seek(0)
+                                self.player.module_ = torch.load(
+                                    ram_buffer, map_location=torch.device("cpu"))
+                                self.player.initialized_ = True
+                                self.experience_memory.apply(self.update_experience_score)
+                            print("synced successfully!")
+                            timer = perf_counter()
+
+                        scores = self.player.predict_proba(
+                            gamestate.reshape((1, -1)))
+                        if self._random.random() < self.exploration_rate:
+                            action = self._random.integers(scores.shape[1])
+                        else:
+                            action = scores.argmax(1)[0]
+                        score = scores[0, action]
+                        if experience is not None:
+                            experience.state1 = gamestate
+                            experience.score1 = score
+                            experience.done = False
+                            self.experience_memory.memorize_new_experience(experience)
+                        experience = Experience(state0=gamestate,
+                                                action=action,
+                                                score0=score)
+
+                        time, inputs = self._get_inputs(action)
+                        inputs_directions = [press for press in inputs if press in DIRECTIONS]
+                        nb_frameadvances = self.SKIP_MULTIPLIERS[time] * self._skip_after_input
+                        self._frameadvance_with_inputs_and_autofire(inputs)
+                    else:
+                        self._frameadvance_with_inputs_and_autofire(inputs_directions)
+
+                    i += 1
+
                 if must_reset:
                     break
 
@@ -150,15 +206,15 @@ class GradiusLoopFn:
 
         return time, inputs
 
-
-def gradius_loop_fn_init():
-    return GradiusLoopFn(FRAME_PER_ACTION)
-
+    def update_experience_score(self, experience):
+        experience.score1 = self.player.predict_proba(experience.state1.reshape((1, -1)))[
+            0, experience.action]
+        return experience
 
 def _gradius_parse_action_nb(action):
-    time = torch.div(action, 18, rounding_mode="floor")
+    time = action // 18
     action = action % 18
-    press_b = torch.div(action, 9, rounding_mode="floor")
+    press_b = action // 9
     direction = action % 9
     return time, press_b, direction
 
@@ -192,9 +248,96 @@ def _gradius_reward_fn(data_before, data_after, action, done):
     ) / 83
 
 
+class GradiusExperienceMemory:
+
+    def __init__(self, ordinary_memory_size, oustanding_memory_size, reward_cutoff):
+        self.ordinary_memory = ExperienceMemory(ordinary_memory_size)
+        self.outstanding_memory = ExperienceMemory(oustanding_memory_size)
+        self.reward_cutoff = reward_cutoff
+        self._random = np.random.default_rng(42)
+
+    def memorize_new_experience(self, experience):
+        experience.reward = _gradius_reward_fn(
+            experience.state0, experience.state1, experience.action, experience.done)
+
+        memory = (self.outstanding_memory if (experience.reward < self.reward_cutoff)
+                  else self.ordinary_memory)
+        memory.memorize_new_experience(experience)
+
+    def get_random_experiences(self, nb_experiences):
+        is_outstanding = (self._random.random(nb_experiences) < (
+            self.outstanding_memory.nb_memories/(self.outstanding_memory.nb_memories
+                                                 + self.ordinary_memory.nb_memories)))
+        nb_outstanding = is_outstanding.sum()
+        outstanding_memories = self.outstanding_memory.get_random_experiences(nb_outstanding)
+        ordinary_memories = self.ordinary_memory.get_random_experiences(
+            nb_experiences-nb_outstanding)
+        memories = np.hstack((outstanding_memories, ordinary_memories))
+        self._random.shuffle(memories)
+        return memories
+
+    def apply(self, fn):
+        self.ordinary_memory.apply(fn)
+        self.outstanding_memory.apply(fn)
+
+    @property
+    def nb_memories(self):
+        return self.ordinary_memory.nb_memories + self.outstanding_memory.nb_memories
+
+
+class MemoryStreamDataset(IterableDataset):
+    def __init__(self, experience_memory, min_nb_memories):
+        self.experience_memory = experience_memory
+        self.min_nb_memories = min_nb_memories
+
+    def __iter__(self):
+        while self.experience_memory.nb_memories < self.min_nb_memories:
+            sleep(1)
+
+        while True:
+            experience = self.experience_memory.get_random_experiences(1)[0]
+            (data_before, data_after, action, done, reward,
+             score_before, score_after) = astuple(experience)
+            print(((action, reward, done, score_after)))
+            yield data_before, (action, reward, done, score_after)
+
+
+class RLLoss(torch.nn.Module):
+
+    def __init__(self, base_criterion, discount):
+        super().__init__()
+        self.base_criterion = base_criterion()
+        self.discount = discount
+
+    def forward(self, prediction, y):
+        action, reward, done, score_after = y
+        prediction = prediction[torch.arange(prediction.size(0)), action]
+        actual = reward + self.discount * score_after * (~done)
+        return self.base_criterion(prediction, actual)
+
+
+class UpdateEmbeddings(Callback):
+    def on_batch_end(self, net, *args, **kwargs):
+        if net.module_._embedding_bag.update_embeddings():
+            del net.optimizer_
+            net._initialize_optimizer()
+
+
+class LockCompute(Callback):
+    def __init__(self, lock):
+        self.lock = lock
+    def on_batch_begin(self, *args, **kwargs):
+        self.lock.acquire()
+    def on_batch_end(self, *args, **kwargs):
+        self.lock.release()
+
 if __name__ == "__main__":
 
-    copain_ai = CopainAI(
+    torch.set_num_threads(1)
+
+    weight_sync_lock = Lock()
+
+    player = NeuralNet(
         module=CopainANN,
         module__n_actions=_GRADIUS_N_ACTIONS,
         module__input_dim=_GRADIUS_MEMORY_SIZE,
@@ -207,42 +350,58 @@ if __name__ == "__main__":
         module__p_dropout=P_DROPOUT,
         module__initialize_fn=torch.nn.init.kaiming_normal_,
         module__initialize_fn_kwargs=dict(nonlinearity="relu"),
-        criterion=torch.nn.HuberLoss,
-        reward_fn=_gradius_reward_fn,
+        criterion=RLLoss,
+        criterion__base_criterion = torch.nn.HuberLoss,
+        criterion__discount = DISCOUNT_RATE,
         optimizer=torch.optim.Adam,
         optimizer__amsgrad=True,
         lr=LR,
-        discount=DISCOUNT_RATE,
-        exploration_rate=EXPLORATION_RATE,
-        epoch_duration=EPOCH_DURATION,
         max_epochs=100,
-        experience_replay_size=EXPERIENCE_REPLAY_SIZE,
-        experience_replay_burn_in=EXPERIENCE_REPLAY_BURN_IN,
-        training_batch_size=TRAINING_BATCH_SIZE,
-        evaluation_batch_size=EVALUATION_BATCH_SIZE,
-        collate_fn=default_collate,
-        random_action_fn=gradius_random_action,
-        enable_amp=ENABLE_AMP,
-        amp_init_scaling=AMP_INIT_SCALING,
-        device=DEVICE,
+        batch_size=BATCH_SIZE,
+        amp_enabled=AMP_ENABLED,
+        amp_init_scale=AMP_INIT_SCALE,
+        device="cpu",
+        train_split=None,
     )
-    copain_ai.set_training(ENABLE_TRAINING)
+
+    trainer = clone(player)
+    trainer.set_params(device=DEVICE,
+                       callbacks=[("Embedding_Mgt", UpdateEmbeddings()),
+                                  ("sync_callback", LockCompute(weight_sync_lock))])
+
+    experience_memory = GradiusExperienceMemory(MAX_NB_ORDINARY_MEMORIES,
+                                                MAX_NB_OUTSTANDING_MEMORIES, REWARD_CUTOFF)
+
+    player.initialize()
+
+    # create experience memory using EXPERIENCE_REPLAY_SIZE (EXPERIENCE_REPLAY_BURN_IN ?)
+    def gradius_loop_fn_init():
+        return GradiusIALoopFn(EXPLORATION_RATE, FRAME_PER_ACTION, player, trainer,
+                               weight_sync_lock, experience_memory, PLAYER_WEIGHT_REFRESH_RATE)
 
     copain = CopainRun(
         rom_path=ROM_PATH,
         rom_hash=ROM_HASH,
         loop_fn_init=gradius_loop_fn_init,
-        threaded_socket=THREADED_SOCKET,
-        threaded_requests=THREADED_REQUESTS,
-        num_runners=NUM_RUNNERS,
         enable_game_genie=ENABLE_GAME_GENIE,
         display_fceux_gui=DISPLAY_FCEUX_GUI,
-        visible_enable_sound=ENABLE_SOUND,
-        visible_speedmode=SPEEDMODE,
-        visible_render_sprites=RENDER_SPRITES,
-        visible_render_background=RENDER_BACKGROUND,
+        enable_sound=ENABLE_SOUND,
+        speedmode=SPEEDMODE,
+        render_sprites=RENDER_SPRITES,
+        render_background=RENDER_BACKGROUND,
         tmp_folder=TMP_FOLDER,
         fceux_executable=FCEUX_EXECUTABLE,
-        copain_ai=copain_ai,
-        threaded_ai=True,
-    ).run()
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as thread_executor:
+        thread_executor.submit(copain.run)
+        dataset = MemoryStreamDataset(experience_memory, min_nb_memories=MEMORY_BURN_IN)
+        trainer.fit(dataset)
+
+# TODO:
+# sync in separate thread, and update memory with gpu
+# several player threads
+# one of the players is normal speed to spectate
+# reduce input space (no bonus, no time)
+# prefill the memory with a pre-saved movie ?
+# clean mess

@@ -254,14 +254,4 @@ end
 register_action(movie_rerecordcount)  -- 22
 
 
--- misc
-
-local function get_runner_id()
-    local runner_id = assert(os.getenv("COPAIN_RUN_ID"))
-    if string.len(runner_id) == 1 then runner_id = runner_id .. "\0" end
-    assert(socket.send(socket_fd, runner_id))
-end
-register_action(get_runner_id)  -- 23
-
-
 return driver

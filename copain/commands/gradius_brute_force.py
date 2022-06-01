@@ -13,10 +13,6 @@ RENDER_BACKGROUND = True
 
 TMP_FOLDER = "/tmp/"
 
-NUM_RUNNERS = 1
-THREADED_SOCKET = True
-THREADED_REQUESTS = True
-
 FRAME_PER_ACTION = 16
 NUMBER_OF_SAVESTATES = 10
 ACTIONS_PER_SAVESTATES = 12
@@ -108,7 +104,7 @@ class GradiusLoopFn:
         self.nb_preferred_positions = len(preferred_positions)
         self.nb_fails_before_position_change = nb_fails_before_position_change
 
-    def __call__(self, handler, run_metadata):
+    def __call__(self, handler):
         self._register_handler(handler)
 
         # temporally ordered savestates
@@ -326,15 +322,12 @@ if __name__ == "__main__":
         rom_path=ROM_PATH,
         rom_hash=ROM_HASH,
         loop_fn_init=gradius_loop_fn_init,
-        threaded_socket=THREADED_SOCKET,
-        threaded_requests=THREADED_REQUESTS,
-        num_runners=NUM_RUNNERS,
         enable_game_genie=ENABLE_GAME_GENIE,
         display_fceux_gui=DISPLAY_FCEUX_GUI,
-        visible_enable_sound=ENABLE_SOUND,
-        visible_speedmode=SPEEDMODE,
-        visible_render_sprites=RENDER_SPRITES,
-        visible_render_background=RENDER_BACKGROUND,
+        enable_sound=ENABLE_SOUND,
+        speedmode=SPEEDMODE,
+        render_sprites=RENDER_SPRITES,
+        render_background=RENDER_BACKGROUND,
         tmp_folder=TMP_FOLDER,
         fceux_executable=FCEUX_EXECUTABLE,
     ).run()
