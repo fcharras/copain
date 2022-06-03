@@ -16,7 +16,7 @@ TMP_FOLDER = "/tmp/"
 FRAME_PER_ACTION = 16
 
 MAX_NB_ORDINARY_MEMORIES = 5000
-MAX_NB_OUTSTANDING_MEMORIES = 5000
+MAX_NB_OUTSTANDING_MEMORIES = 10000
 REWARD_CUTOFF = 0.5
 MEMORY_BURN_IN = 1000
 
@@ -35,7 +35,8 @@ HIDDEN_DIM = 4096
 P_DROPOUT = 0.5
 
 DISCOUNT_RATE = 0.5
-EXPLORATION_RATE = 0.1
+EXPLORATION_RATE = 0.001
+RANDOM_START = True
 PLAYER_WEIGHT_REFRESH_RATE = 60
 
 
@@ -79,7 +80,7 @@ class GradiusIALoopFn:
     SKIP_MULTIPLIERS = [1, 2, 4]
 
     def __init__(self, exploration_rate, frame_per_action, player, trainer, weight_sync_lock,
-                 experience_memory, weight_refresh_rate):
+                 experience_memory, weight_refresh_rate, random_start):
         self._skip_after_input = frame_per_action - 1
         self.player = player
         self.trainer = trainer
@@ -88,6 +89,7 @@ class GradiusIALoopFn:
         self.experience_memory = experience_memory
         self.exploration_rate = exploration_rate
         self._random = np.random.default_rng(42)
+        self.random_start = random_start
 
     def __call__(self, handler):
         self.handler = handler
@@ -124,14 +126,15 @@ class GradiusIALoopFn:
                                 ram_buffer.seek(0)
                                 self.player.module_ = torch.load(
                                     ram_buffer, map_location=torch.device("cpu"))
+                                del ram_buffer
                                 self.player.initialized_ = True
-                                self.experience_memory.apply(self.update_experience_score)
+                                self.update_experience_scores()
                             print("synced successfully!")
                             timer = perf_counter()
 
                         scores = self.player.predict_proba(
                             gamestate.reshape((1, -1)))
-                        if self._random.random() < self.exploration_rate:
+                        if experience is None or self._random.random() < self.exploration_rate:
                             action = self._random.integers(scores.shape[1])
                         else:
                             action = scores.argmax(1)[0]
@@ -206,10 +209,32 @@ class GradiusIALoopFn:
 
         return time, inputs
 
-    def update_experience_score(self, experience):
-        experience.score1 = self.player.predict_proba(experience.state1.reshape((1, -1)))[
-            0, experience.action]
-        return experience
+    def update_experience_scores(self):
+        self.trainer.module_.to(torch.device("cpu"))
+        self.player.module_.to(torch.device("cuda"))
+        self.player.device = "cuda"
+        experiences = self.experience_memory.get_all_experiences()
+        current_idx = 0
+        batch_size = self.player.batch_size
+        while current_idx < len(experiences):
+            experience_batch = experiences[current_idx:(current_idx+batch_size)]
+            gamestates = []
+            actions = []
+            for experience in experience_batch:
+                experience.score1 = None
+                gamestates.append(experience.state1)
+                actions.append(experience.action)
+            gamestates = np.vstack(gamestates)
+            actions = np.array(actions)
+            scores = self.player.predict_proba(gamestates)
+            scores = scores[np.arange(scores.shape[0]), actions]
+            for i, experience in enumerate(experience_batch):
+                experience.score1 = scores[i]
+            current_idx += batch_size
+        self.player.module_.to(torch.device("cpu"))
+        self.player.device = "cpu"
+        self.trainer.module_.to(torch.device("cuda"))
+
 
 def _gradius_parse_action_nb(action):
     time = action // 18
@@ -243,10 +268,10 @@ def _gradius_reward_fn(data_before, data_after, action, done):
         - int(any_direction)
         + 2 * time
         - 4 * press_b
-        + 8 * score_diff
+        + 32 * score_diff
         - 64 * int(done)
-    ) / 83
-
+#    ) / 83
+    ) / 100
 
 class GradiusExperienceMemory:
 
@@ -276,9 +301,9 @@ class GradiusExperienceMemory:
         self._random.shuffle(memories)
         return memories
 
-    def apply(self, fn):
-        self.ordinary_memory.apply(fn)
-        self.outstanding_memory.apply(fn)
+    def get_all_experiences(self):
+        return np.hstack((self.ordinary_memory.get_all_experiences(),
+                          self.outstanding_memory.get_all_experiences()))
 
     @property
     def nb_memories(self):
@@ -298,7 +323,6 @@ class MemoryStreamDataset(IterableDataset):
             experience = self.experience_memory.get_random_experiences(1)[0]
             (data_before, data_after, action, done, reward,
              score_before, score_after) = astuple(experience)
-            print(((action, reward, done, score_after)))
             yield data_before, (action, reward, done, score_after)
 
 
@@ -377,7 +401,8 @@ if __name__ == "__main__":
     # create experience memory using EXPERIENCE_REPLAY_SIZE (EXPERIENCE_REPLAY_BURN_IN ?)
     def gradius_loop_fn_init():
         return GradiusIALoopFn(EXPLORATION_RATE, FRAME_PER_ACTION, player, trainer,
-                               weight_sync_lock, experience_memory, PLAYER_WEIGHT_REFRESH_RATE)
+                               weight_sync_lock, experience_memory, PLAYER_WEIGHT_REFRESH_RATE,
+                               RANDOM_START)
 
     copain = CopainRun(
         rom_path=ROM_PATH,

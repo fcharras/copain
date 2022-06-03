@@ -51,9 +51,9 @@ class ExperienceMemory:
                 self._memory[: self._max_memory_idx], nb_experiences, replace=True
             )
 
-    def apply(self, fn):
-        for i in range(self.nb_memories):
-            self._memory[i] = fn(self._memory[i])
+    def get_all_experiences(self):
+        with self._lock:
+            return self._memory[:self.nb_memories]
 
     @property
     def nb_memories(self):
