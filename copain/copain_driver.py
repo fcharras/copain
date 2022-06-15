@@ -246,13 +246,6 @@ class _Driver:
     def movie_rerecordcount(self):
         return np.frombuffer(self.request.recv(8), dtype=np.uint64)[0]
 
-
-    """misc"""
-
-    @register_action  # 23
-    def get_runner_id(self):
-        return np.frombuffer(self.request.recv(2), dtype=np.uint16)[0]
-
     """internal only"""
 
     def _gc(self):
@@ -268,82 +261,38 @@ class _Driver:
         self.request.sendall(np.uint16(len(load)).tobytes())
         self.request.sendall(load)
 
+
 @dataclass(frozen=True)
 class CopainRunMetadata:
-    _VISIBLE_RUNNER_ID = 1
-
     rom_path: str
     rom_hash: str
-    runner_id: int
-    total_nb_runners: int
-    is_visible_runner: bool = field(init=False)
-
-    def __post_init__(self):
-        object.__setattr__(
-            self, "is_visible_runner", self.runner_id == self._VISIBLE_RUNNER_ID
-        )
 
 
 class _CopainLoopFn:
     def __init__(
         self,
-        display_visible_runner,
-        total_nb_runners,
-        visible_speedmode,
-        visible_render_sprites,
-        visible_render_background,
+        speedmode,
+        render_sprites,
+        render_background,
         rom_path,
         rom_hash,
         loop_fn_init,
-        copain_ai,
     ):
-        self.display_visible_runner = display_visible_runner
-        self.total_nb_runners = total_nb_runners
-        self.visible_speedmode = visible_speedmode
-        self.visible_render_sprites = visible_render_sprites
-        self.visible_render_background = visible_render_background
+        self.speedmode = speedmode
+        self.render_sprites = render_sprites
+        self.render_background = render_background
         self.rom_path = rom_path
         self.rom_hash = rom_hash
         self.loop_fn_init = loop_fn_init
-        self.copain_ai = copain_ai
 
     def __call__(self, handler):
         if not handler.request.getblocking():
             raise RuntimeError("Expected a socket in blocking mode.")
 
-        runner_id = handler.get_runner_id()
-
-        run_metadata = CopainRunMetadata(
-            rom_path=self.rom_path,
-            rom_hash=self.rom_hash,
-            runner_id=runner_id,
-            total_nb_runners=self.total_nb_runners,
-        )
-        is_visible_runner = run_metadata.is_visible_runner
-
-        if is_visible_runner and self.display_visible_runner:
-            if self.visible_speedmode is not None:
-                speedmode = self.visible_speedmode
-            else:
-                speedmode = "maximum" if self.total_nb_runners == 1 else "normal"
-
-            visible_render_sprites = (
-                self.visible_render_sprites is None
-            ) or self.visible_render_sprites
-
-            visible_render_background = (
-                self.visible_render_background is None
-            ) or self.visible_render_background
-
-        else:
-            speedmode = "maximum"
-            visible_render_sprites = False
-            visible_render_background = False
-
-        handler.emu_speedmode(speedmode)
+        handler.emu_speedmode(self.speedmode)
         handler.emu_setrenderplanes(
-            sprites=b"\x01" if visible_render_sprites else b"\x00",
-            background=b"\x01" if visible_render_background else b"\x00",
+            sprites=b"\x01" if self.render_sprites else b"\x00",
+            background=b"\x01" if self.render_background else b"\x00",
         )
 
         actual_hash = handler.rom_gethash("md5")
@@ -352,6 +301,11 @@ class _CopainLoopFn:
                 f"The ROM that has been loaded at {self.rom_path} has md5 hash "
                 f"{actual_hash} but expected hash {self.rom_hash}"
             )
+
+        run_metadata = CopainRunMetadata(
+            rom_path=self.rom_path,
+            rom_hash=self.rom_hash,
+        )
 
         kwargs = dict()
 
@@ -366,22 +320,6 @@ class _CopainLoopFn:
             )
         ):
             kwargs["run_metadata"] = run_metadata
-
-        pass_copain_ai = ("copain_ai" in loop_fn_signature) and not any(
-            kind is loop_fn_signature["copain_ai"].kind
-            for kind in (
-                inspect.Parameter.VAR_KEYWORD,
-                inspect.Parameter.VAR_POSITIONAL,
-            )
-        )
-
-        if pass_copain_ai is not (self.copain_ai is not None):
-            raise ValueError(
-                "Expecting an instantiated copain_ai if and only if the loop_fn expects a parameter named copain_ai"
-            )
-
-        if pass_copain_ai:
-            kwargs["copain_ai"] = self.copain_ai
 
         return loop_fn(
             handler,
